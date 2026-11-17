@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,21 +29,16 @@ from src.utils.logger import setup_logger  # noqa: E402
 #: Default vendor adapter name when no host-specific match is found.
 DEFAULT_VENDOR = "ticketmaster"
 
-#: Mapping from event-URL host suffix to vendor adapter name. Order
-#: matters: the first suffix that matches the URL's host wins. Generic
-#: hosts (like ``ticketmaster.com``) are intentionally absent — anything
-#: not matched here falls through to :data:`DEFAULT_VENDOR`.
-_HOST_VENDOR_MAP: tuple[tuple[str, str], ...] = (("ticketmaster.sg", "ticketmaster_sg"),)
+#: Mapping from event-URL host suffix to vendor adapter name.
+#: ticketmaster.com.br falls through to the default US adapter (no dedicated BR adapter yet).
+_HOST_VENDOR_MAP: tuple[tuple[str, str], ...] = (
+    ("ticketmaster.sg", "ticketmaster_sg"),
+    # ticketmaster.com.br → DEFAULT_VENDOR (US adapter used as best-effort)
+)
 
 
 def detect_vendor_for_url(url: str) -> str:
-    """Return the vendor adapter name implied by ``url``'s host.
-
-    Lookup is suffix-based: ``ticketmaster.sg`` and any subdomain
-    thereof (``www.ticketmaster.sg``, ``my.ticketmaster.sg``) pick the
-    SG adapter. URLs whose host doesn't match any entry in
-    :data:`_HOST_VENDOR_MAP` fall through to :data:`DEFAULT_VENDOR`.
-    """
+    """Return the vendor adapter name implied by ``url``'s host."""
     host = (urlparse(url).hostname or "").lower()
     if not host:
         return DEFAULT_VENDOR
@@ -53,12 +49,7 @@ def detect_vendor_for_url(url: str) -> str:
 
 
 def _resolve_vendor_adapter(name: str) -> Any:
-    """Look up the vendor adapter class for ``name`` or raise ValueError.
-
-    The shipped Ticketmaster adapters are registered as a side effect of
-    importing :mod:`src.vendors` (which we import here lazily so a CLI
-    failure path doesn't pay the import cost twice).
-    """
+    """Look up the vendor adapter class for ``name`` or raise ValueError."""
     import src.vendors  # noqa: F401  (registers all VendorAdapters)
 
     try:
@@ -76,7 +67,8 @@ async def _check_proxies(config, log) -> None:
     from src.proxy.check import check_proxy
 
     proxy_url = config.proxy.urls[0]
-    log.info("Testing proxy connectivity: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
+    safe = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+    log.info("Testing proxy connectivity: %s", safe)
     result = await check_proxy(proxy_url)
     if result["ok"]:
         log.info("Proxy OK — public IP: %s (via %s)", result["ip"], result["endpoint"])
@@ -85,16 +77,37 @@ async def _check_proxies(config, log) -> None:
         log.warning("Continuing anyway — the browser may still work if the proxy is intermittent.")
 
 
+def _readiness_warnings(config, log) -> None:
+    """Emit warnings for common missing pieces before launch."""
+    # Placeholder event URL
+    url = config.events[0].url if config.events else ""
+    if "REPLACE_WITH" in url or not url.startswith("http"):
+        log.warning("Event URL looks like a placeholder: %s", url)
+
+    # Accounts
+    if not config.accounts:
+        log.warning("No accounts configured. Set accounts.yaml or TM_EMAIL / TM_PASSWORD.")
+
+    # Captcha keys when auto_solve is on
+    if config.captcha.auto_solve:
+        if "capsolver" in config.captcha.providers and not os.getenv("CAPSOLVER_API_KEY"):
+            log.warning("captcha.auto_solve is on and capsolver is listed, but CAPSOLVER_API_KEY is unset.")
+        if "openai_vlm" in config.captcha.providers and not os.getenv("OPENAI_API_KEY"):
+            log.warning("captcha.auto_solve is on and openai_vlm is listed, but OPENAI_API_KEY is unset.")
+
+    # Brazil note
+    host = (urlparse(url).hostname or "").lower()
+    if "ticketmaster.com.br" in host:
+        log.info("ticketmaster.com.br detected — using US adapter as best-effort (no dedicated BR adapter).")
+
+
 async def main_async(args: argparse.Namespace | None = None) -> int:
     if args is None:
         args = parse_args()
 
-    # Bootstrap a minimal logger so config-load errors are visible.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     bootstrap_log = logging.getLogger("ticketmaster-bot")
 
-    # --- 1. Validate an explicit --vendor up front. Auto-detection
-    #        defers until step 5 (after the config tells us the URL).
     adapter_cls: Any | None = None
     if args.vendor is not None:
         try:
@@ -103,23 +116,16 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
-    # --- 2. Parse --set overrides --------------------------------------
     try:
         overrides = parse_set_overrides(args.set_overrides)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # --- 3. Apply --events as an overlay so it wins over file values ---
     event_urls = parse_events_flag(args.events)
     if event_urls:
-        # Replace any baseline events / legacy event key wholesale.
         overrides["events"] = [{"url": url} for url in event_urls]
-        # The legacy single-event key in the base file would otherwise
-        # still win when 'events:' is absent from the merged tree.
-        # Setting events:[...] in the overrides supersedes it.
 
-    # --- 4. Load config (handles --profile and ${VAR} expansion) --------
     try:
         config = load_config(
             args.config,
@@ -136,10 +142,6 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
     if args.auto_purchase is not None:
         config.checkout.auto_purchase = args.auto_purchase
 
-    # --- 5. Vendor auto-detection (only when --vendor wasn't passed) ---
-    # The first configured event URL's host decides whether to use the
-    # SG adapter (`ticketmaster.sg`) or fall back to the default US/CA
-    # Ticketmaster adapter.
     if adapter_cls is None:
         vendor_name = detect_vendor_for_url(config.events[0].url)
         try:
@@ -151,9 +153,6 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
     else:
         resolved_vendor = args.vendor
 
-    # --- 6. --explain prints resolved YAML and exits --------------------
-    # Logging is intentionally NOT reconfigured first so that stdout
-    # contains only the resolved YAML.
     if args.explain:
         sys.stdout.write(config_to_yaml(config))
         sys.stdout.flush()
@@ -184,7 +183,7 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         )
     log.info("=" * 60)
 
-    # --- Proxy connectivity check (when enabled) ------------------------
+    _readiness_warnings(config, log)
     await _check_proxies(config, log)
 
     account = None
@@ -201,10 +200,6 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         log.info("Dry run: config validated successfully. Exiting before launch.")
         return 0
 
-    # --- Parallel multi-account path ----------------------------------
-    # The orchestrator races one runner per configured account. We keep
-    # this path opt-in (--parallel) so single-account users get the
-    # historic single-context behaviour untouched.
     if args.parallel:
         from src.orchestrator.parallel import ParallelCoordinator
 
@@ -218,9 +213,9 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         max_parallel = args.max_parallel if args.max_parallel is not None else 3
         stagger_seconds = args.stagger_seconds if args.stagger_seconds is not None else 5.0
 
-        adapter_cls()  # validate the vendor adapter is constructible
+        adapter_cls()
 
-        def _factory(acct, cfg, _stop):  # noqa: ANN001 - inner closure
+        def _factory(acct, cfg, _stop):  # noqa: ANN001
             return adapter_cls().build_runner(cfg, account=acct)
 
         coordinator = ParallelCoordinator(
@@ -235,7 +230,7 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         except KeyboardInterrupt:
             log.warning("Interrupted by user")
             return 130
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("Parallel coordinator crashed")
             return 1
         return 0 if success else 1
@@ -247,7 +242,7 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("Interrupted by user")
         return 130
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.exception("Bot crashed")
         return 1
     return 0 if success else 1
