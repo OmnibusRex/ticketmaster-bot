@@ -23,6 +23,7 @@ from .base import (
     ChallengeType,
 )
 from .chain import CaptchaSolverChain
+from .providers.capsolver import CapSolverSolver
 from .providers.openai_vlm import OpenAIVLMSolver
 
 
@@ -35,6 +36,7 @@ def _register_default_solvers() -> None:
     """
     defaults: dict[str, type[CaptchaSolver]] = {
         "openai_vlm": OpenAIVLMSolver,
+        "capsolver": CapSolverSolver,
     }
     for name, cls in defaults.items():
         if name in _captcha_registry.registry:
@@ -52,4 +54,5 @@ __all__ = [
     "CaptchaSolverChain",
     "ChallengeType",
     "OpenAIVLMSolver",
+    "CapSolverSolver",
 ]
