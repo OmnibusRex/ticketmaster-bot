@@ -8,6 +8,7 @@ the top-level package wires them in.
 
 from __future__ import annotations
 
+from .capsolver import CapSolverSolver
 from .openai_vlm import OpenAIVLMSolver
 
-__all__ = ["OpenAIVLMSolver"]
+__all__ = ["OpenAIVLMSolver", "CapSolverSolver"]
