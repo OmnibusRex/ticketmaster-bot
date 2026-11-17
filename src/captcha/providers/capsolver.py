@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -16,6 +18,13 @@ from ..retry import retry_async
 log = logging.getLogger("ticketmaster-bot")
 
 CAPSOLVER_API = "https://api.capsolver.com"
+
+# Common reCAPTCHA sitekey patterns found in page source / data attributes.
+_SITEKEY_RE = re.compile(
+    r"(?:data-sitekey|sitekey|grecaptcha\.render\([^)]*['\"]sitekey['\"]\s*:\s*['\"])"
+    r"[\s\"':=]+['\"]([0-9A-Za-z_-]{20,})['\"]",
+    re.IGNORECASE,
+)
 
 
 class CapSolverSolver(CaptchaSolver):
@@ -41,6 +50,38 @@ class CapSolverSolver(CaptchaSolver):
     def supports(cls) -> set[str]:
         return {"recaptcha", "yii_image"}
 
+    async def _extract_sitekey(self, challenge: CaptchaChallenge) -> tuple[str | None, str | None]:
+        """Try to pull websiteKey and websiteURL from the live page."""
+        page = challenge.page
+        if page is None:
+            return None, None
+
+        try:
+            url = page.url
+        except Exception:
+            url = None
+
+        sitekey: str | None = None
+        try:
+            # 1. data-sitekey attribute (most common)
+            el = page.locator("[data-sitekey]").first
+            if await el.count() > 0:
+                sitekey = await el.get_attribute("data-sitekey")
+        except Exception:
+            pass
+
+        if not sitekey:
+            try:
+                # 2. Fall back to scanning page content
+                content = await page.content()
+                m = _SITEKEY_RE.search(content)
+                if m:
+                    sitekey = m.group(1)
+            except Exception:
+                pass
+
+        return sitekey, url
+
     async def solve(self, challenge: CaptchaChallenge) -> CaptchaSolution | None:
         """Attempt to solve the challenge via CapSolver."""
         if not self.api_key:
@@ -48,24 +89,28 @@ class CapSolverSolver(CaptchaSolver):
 
         start = time.perf_counter()
 
-        # Build a minimal task payload. Extend based on challenge_type.
-        # For real use, extract websiteKey / websiteURL from the page.
-        task_payload: dict[str, Any] = {
-            "type": "ReCaptchaV2TaskProxyLess",
-            "websiteURL": "https://www.ticketmaster.com",
-            "websiteKey": "6Le-wvkSAAAAAPBMRTvw0Q4Muexq9bi0DJwx_mJ-",  # placeholder
-        }
-        if challenge.challenge_type == "yii_image" and challenge.screenshot_bytes:
-            import base64
+        task_payload: dict[str, Any]
 
+        if challenge.challenge_type == "yii_image" and challenge.screenshot_bytes:
             task_payload = {
                 "type": "ImageToTextTask",
                 "body": base64.b64encode(challenge.screenshot_bytes).decode("ascii"),
             }
+        else:
+            # reCAPTCHA path — try to extract sitekey from the page
+            sitekey, page_url = await self._extract_sitekey(challenge)
+            if not sitekey:
+                log.warning("capsolver: could not extract reCAPTCHA sitekey from page")
+                return None
+            task_payload = {
+                "type": "ReCaptchaV2TaskProxyLess",
+                "websiteURL": page_url or "https://www.ticketmaster.com",
+                "websiteKey": sitekey,
+            }
+            log.info("capsolver: using sitekey=%s… from %s", sitekey[:8], page_url)
 
         async def _do_solve() -> dict[str, Any]:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # createTask
                 resp = await client.post(
                     f"{CAPSOLVER_API}/createTask",
                     json={"clientKey": self.api_key, "task": task_payload},
@@ -76,7 +121,6 @@ class CapSolverSolver(CaptchaSolver):
                     raise RuntimeError(data.get("errorDescription", "createTask failed"))
                 task_id = data["taskId"]
 
-                # poll
                 async def check() -> dict[str, Any] | None:
                     r = await client.post(
                         f"{CAPSOLVER_API}/getTaskResult",
