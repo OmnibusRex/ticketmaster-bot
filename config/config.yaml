@@ -128,21 +128,24 @@ notifications:
   desktop: true
   sound: true
 
-# Per-account proxy assignment. Disabled by default; set ``enabled: true``
-# and populate ``urls`` to route Playwright's ``launch_persistent_context``
-# through HTTP / HTTPS / SOCKS proxies.
+# ---------------------------------------------------------------------------
+# Proxy (residential recommended)
+# ---------------------------------------------------------------------------
+# Supports HTTP, HTTPS and SOCKS5.
+# Credentials can be embedded in the URL (recommended) or left empty for
+# IP-whitelist proxies.
 #
-# ``policy: sticky`` deterministically maps each account name to the same
-# proxy across runs. ``policy: round_robin`` rotates through ``urls`` on
-# every account, useful when running the parallel coordinator with N
-# accounts and N proxies.
+# Residential / mobile proxy examples (replace with your provider):
+#   http://user-session-abc123:pass@geo.iproyal.com:12321
+#   socks5://user:pass@brd.superproxy.io:22225
+#   http://user:pass@proxy.packetstream.io:31112
 #
-# Each entry is a full proxy URL; embedded credentials are split out into
-# Playwright's separate username/password fields automatically.
+# Sticky policy (recommended for residential): same account always gets
+# the same proxy. Round-robin rotates on every launch.
 proxy:
   enabled: false
   policy: "sticky"          # sticky | round_robin
-  urls: []                  # e.g. ["http://USERNAME:PASSWORD@proxy.example.com:8080"]
+  urls: []                  # e.g. ["http://USER:PASS@proxy.example.com:8080"]
 
 # Automated captcha-solving chain. Off by default so the existing
 # human-pause behaviour in ``wait_for_human_if_captcha`` is preserved;
@@ -167,6 +170,7 @@ captcha:
   auto_solve: false
   providers:
     - "openai_vlm"
+    - "capsolver"
   retries_per_provider: 5
   refresh_between_attempts: true
   captcha_timeout_seconds: 300
