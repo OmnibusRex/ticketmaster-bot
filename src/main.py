@@ -68,6 +68,23 @@ def _resolve_vendor_adapter(name: str) -> Any:
         raise ValueError(f"Unknown vendor {name!r}. Registered vendors: {available}") from exc
 
 
+async def _check_proxies(config, log) -> None:
+    """If proxies are enabled, test the first one and log the public IP."""
+    if not config.proxy.enabled or not config.proxy.urls:
+        return
+
+    from src.proxy.check import check_proxy
+
+    proxy_url = config.proxy.urls[0]
+    log.info("Testing proxy connectivity: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
+    result = await check_proxy(proxy_url)
+    if result["ok"]:
+        log.info("Proxy OK — public IP: %s (via %s)", result["ip"], result["endpoint"])
+    else:
+        log.warning("Proxy check failed: %s", result["error"])
+        log.warning("Continuing anyway — the browser may still work if the proxy is intermittent.")
+
+
 async def main_async(args: argparse.Namespace | None = None) -> int:
     if args is None:
         args = parse_args()
@@ -166,6 +183,9 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
             args.stagger_seconds,
         )
     log.info("=" * 60)
+
+    # --- Proxy connectivity check (when enabled) ------------------------
+    await _check_proxies(config, log)
 
     account = None
     if args.account_name:
