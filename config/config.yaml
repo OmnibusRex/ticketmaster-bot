@@ -68,25 +68,26 @@ timing:
   page_timeout_seconds: 30
   queue_check_interval_seconds: 5
   # Random delay range between human-like actions [min, max], used when
-  # humanize.enabled: true. When false (default) these are not applied.
+  # humanize.enabled: true.
   action_delay_seconds: [0.5, 2.0]
-  # Humanisation subsystems. The master ``enabled`` flag preserves the
-  # historic ``humanize: true|false`` semantics; per-subsystem blocks
-  # (``mouse``, future ``typing``, ``warmer``…) carry their own switches.
+  # Humanisation subsystems. Enabled by default for better anti-detection.
   humanize:
-    enabled: false
-    # Cubic-Bezier cursor moves via ``src.humanize.mouse.bezier_move``.
+    enabled: true
     mouse:
       enabled: true
       steps_min: 20
       steps_max: 40
       delay_ms_min: 8
       delay_ms_max: 25
+    typing:
+      enabled: true
+      mean_ms: 70
+      std_ms: 25
+      min_ms: 20
   # Hard cap on total runtime.
   max_total_runtime_seconds: 3600
   # When the browser is visible and auto_purchase is false, keep the window
-  # open this long so you can complete checkout manually. Closes early if
-  # you close the window yourself.
+  # open this long so you can complete checkout manually.
   hold_open_seconds: 600
 
 browser:
@@ -96,31 +97,21 @@ browser:
   locale: "en-US"
   timezone: "America/New_York"
 
-  # Per-context fingerprint preset. "desktop" keeps the historic 1366x900
-  # / no-touch behaviour. "mobile" switches to a 390x844 touch-enabled
-  # iPhone profile so navigator.maxTouchPoints > 0 and
-  # matchMedia('(pointer: coarse)') matches.
+  # Per-context fingerprint preset. "desktop" or "mobile".
   profile: "desktop"
 
-  # Browser-fingerprint hardening. Removes the most obvious automation tells
-  # (navigator.webdriver, missing plugins/languages, WebGL vendor) and lets you
-  # override the UA and headers. Not a guarantee against detection.
+  # Browser-fingerprint hardening.
   stealth:
     enabled: true
     user_agent: null            # null = random pick from a small modern Chrome pool
     extra_http_headers: {}
     webgl_vendor: "Intel Inc."
     webgl_renderer: "Intel Iris OpenGL Engine"
-    viewport_jitter: 30         # +/- pixels added to default 1366x900 at launch
+    viewport_jitter: 30
 
 logging:
   level: "INFO"                 # DEBUG | INFO | WARNING | ERROR | CRITICAL
   file: "logs/bot.log"
-  # Per-run artefact capture. When ``record_har: true``, Playwright
-  # records a HAR of every network request to
-  # ``logs/run-<UTC>-<account>/network.har``. Combine with
-  # ``ScreenshotOnFailureHook`` to produce a full ``screenshot.png +
-  # dom.html + console.log + network.har`` dump on failures.
   artifacts:
     record_har: false
 
@@ -131,41 +122,12 @@ notifications:
 # ---------------------------------------------------------------------------
 # Proxy (residential recommended)
 # ---------------------------------------------------------------------------
-# Supports HTTP, HTTPS and SOCKS5.
-# Credentials can be embedded in the URL (recommended) or left empty for
-# IP-whitelist proxies.
-#
-# Residential / mobile proxy examples (replace with your provider):
-#   http://user-session-abc123:pass@geo.iproyal.com:12321
-#   socks5://user:pass@brd.superproxy.io:22225
-#   http://user:pass@proxy.packetstream.io:31112
-#
-# Sticky policy (recommended for residential): same account always gets
-# the same proxy. Round-robin rotates on every launch.
 proxy:
   enabled: false
   policy: "sticky"          # sticky | round_robin
-  urls: []                  # e.g. ["http://USER:PASS@proxy.example.com:8080"]
+  urls: []                  # e.g. ["${PROXY_URL}"]
 
-# Automated captcha-solving chain. Off by default so the existing
-# human-pause behaviour in ``wait_for_human_if_captcha`` is preserved;
-# the chain is not even consulted when ``auto_solve: false``.
-#
-# When ``auto_solve: true``, the SG runner builds a
-# ``src.captcha.CaptchaSolverChain`` from ``providers`` (each name is
-# looked up in ``src.captcha.registry.registry``) with
-# ``retries_per_provider`` attempts per provider. The chain is
-# threaded through every ``wait_for_human_if_captcha`` call: when a
-# Yii image captcha is detected the chain runs first, and the
-# human-pause path is only taken when the chain exhausts.
-#
-# ``refresh_between_attempts: true`` invokes the challenge's
-# ``refresh_callable`` between attempts to rotate the Yii image
-# (``/ticket/captcha?refresh=1``). Off keeps the chain solving the
-# *same* captcha across providers.
-#
-# ``captcha_timeout_seconds`` is the overall budget passed into
-# ``wait_for_human_if_captcha`` for the human-pause fallback.
+# Automated captcha-solving chain.
 captcha:
   auto_solve: false
   providers:
