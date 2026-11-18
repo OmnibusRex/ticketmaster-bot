@@ -122,9 +122,13 @@ notifications:
 # ---------------------------------------------------------------------------
 # Proxy (residential recommended)
 # ---------------------------------------------------------------------------
+# policy:
+#   sticky      — same account always gets the same proxy (recommended for login)
+#   round_robin — rotates through the list on every resolve
+#   failover    — skips proxies that recently failed (call mark_failure/mark_success)
 proxy:
   enabled: false
-  policy: "sticky"          # sticky | round_robin
+  policy: "sticky"          # sticky | round_robin | failover
   urls: []                  # e.g. ["${PROXY_URL}"]
 
 # Automated captcha-solving chain.
