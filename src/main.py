@@ -33,7 +33,6 @@ DEFAULT_VENDOR = "ticketmaster"
 #: ticketmaster.com.br falls through to the default US adapter (no dedicated BR adapter yet).
 _HOST_VENDOR_MAP: tuple[tuple[str, str], ...] = (
     ("ticketmaster.sg", "ticketmaster_sg"),
-    # ticketmaster.com.br → DEFAULT_VENDOR (US adapter used as best-effort)
 )
 
 
@@ -60,42 +59,39 @@ def _resolve_vendor_adapter(name: str) -> Any:
 
 
 async def _check_proxies(config, log) -> None:
-    """If proxies are enabled, test the first one and log the public IP."""
+    """If proxies are enabled, try them with automatic fallback and log the IP."""
     if not config.proxy.enabled or not config.proxy.urls:
         return
 
-    from src.proxy.check import check_proxy
+    from src.proxy import ProxyManager, resolve_with_fallback
 
-    proxy_url = config.proxy.urls[0]
-    safe = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
-    log.info("Testing proxy connectivity: %s", safe)
-    result = await check_proxy(proxy_url)
-    if result["ok"]:
-        log.info("Proxy OK — public IP: %s (via %s)", result["ip"], result["endpoint"])
-    else:
-        log.warning("Proxy check failed: %s", result["error"])
-        log.warning("Continuing anyway — the browser may still work if the proxy is intermittent.")
+    manager = ProxyManager(config.proxy)
+    log.info("Proxy policy=%s | count=%d", manager.policy, manager.proxy_count)
+
+    proxy = await resolve_with_fallback(manager, account_name=None)
+    if proxy is None:
+        log.warning("No working proxy found.")
+        return
+
+    server = proxy.get("server", "")
+    log.info("Selected proxy: %s", server)
 
 
 def _readiness_warnings(config, log) -> None:
     """Emit warnings for common missing pieces before launch."""
-    # Placeholder event URL
     url = config.events[0].url if config.events else ""
     if "REPLACE_WITH" in url or not url.startswith("http"):
         log.warning("Event URL looks like a placeholder: %s", url)
 
-    # Accounts
     if not config.accounts:
         log.warning("No accounts configured. Set accounts.yaml or TM_EMAIL / TM_PASSWORD.")
 
-    # Captcha keys when auto_solve is on
     if config.captcha.auto_solve:
         if "capsolver" in config.captcha.providers and not os.getenv("CAPSOLVER_API_KEY"):
             log.warning("captcha.auto_solve is on and capsolver is listed, but CAPSOLVER_API_KEY is unset.")
         if "openai_vlm" in config.captcha.providers and not os.getenv("OPENAI_API_KEY"):
             log.warning("captcha.auto_solve is on and openai_vlm is listed, but OPENAI_API_KEY is unset.")
 
-    # Brazil note
     host = (urlparse(url).hostname or "").lower()
     if "ticketmaster.com.br" in host:
         log.info("ticketmaster.com.br detected — using US adapter as best-effort (no dedicated BR adapter).")
