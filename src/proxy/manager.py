@@ -11,28 +11,26 @@ The ``username``/``password`` keys are emitted **only** when the
 underlying URL carries credentials, matching Playwright's own
 ``ProxySettings`` type where both fields are optional.
 
-Two policies are supported:
+Policies:
 
 * ``sticky`` — every call for a given ``account_name`` returns the same
-  proxy. Mapping is deterministic across processes: it hashes
-  ``account_name`` into the proxies list. New accounts seen at runtime
-  pick the next never-assigned slot before any reuse happens, so a
-  config with two accounts and two proxies always produces a 1-to-1
-  mapping.
-* ``round_robin`` — each call advances a monotonically increasing
-  counter so concurrent accounts get spread evenly. Counter is
-  per-:class:`ProxyManager` instance so a single ``BotRunner`` can run
-  multiple accounts in sequence and rotate cleanly.
+  proxy. Mapping is deterministic across processes.
+* ``round_robin`` — each call advances a counter.
+* ``failover`` — skips proxies that have been marked as failed recently.
+  Falls back to round-robin when all proxies are in a failed state.
+
+Callers can report success/failure with :meth:`mark_success` and
+:meth:`mark_failure` so the manager can avoid bad proxies.
 
 If the proxy list is empty *or* the ``enabled`` flag is false, every
-:meth:`resolve` returns ``None`` so callers can use ``if proxy_kwargs is
-not None`` as the gate on whether to pass ``proxy=...`` at all.
+:meth:`resolve` returns ``None``.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
@@ -41,30 +39,19 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("ticketmaster-bot")
 
+VALID_POLICIES: frozenset[str] = frozenset({"sticky", "round_robin", "failover"})
 
-VALID_POLICIES: frozenset[str] = frozenset({"sticky", "round_robin"})
+# How long a failed proxy stays avoided (seconds).
+_FAIL_COOLDOWN_S = 300.0
+# After this many failures the proxy is avoided until cooldown expires.
+_FAIL_THRESHOLD = 2
 
 
 def parse_proxy_url(url: str) -> dict[str, str]:
-    """Parse a proxy URL into Playwright's ``proxy=`` kwarg shape.
-
-    Accepts URLs in the standard form
-    ``scheme://[USER[:PASSWORD]@]host[:port][/path]``. The ``scheme://``
-    prefix is required; bare ``host:port`` is rejected because
-    Playwright's ProxySettings explicitly requires a scheme.
-
-    Returns a mapping with ``server`` set to the credential-stripped
-    URL (Playwright re-attaches credentials via ``username`` /
-    ``password``). ``username`` and ``password`` are included **only**
-    when present in the source URL.
-    """
+    """Parse a proxy URL into Playwright's ``proxy=`` kwarg shape."""
     if not isinstance(url, str) or not url.strip():
         raise ValueError("proxy URL must be a non-empty string")
     trimmed = url.strip()
-    # ``urlparse`` is forgiving: ``"host:8080"`` parses as scheme=host,
-    # path=8080 because Python interprets the first ``:`` as the scheme
-    # boundary. Require the ``scheme://`` form explicitly so we reject
-    # those before the more specific host/port checks.
     if "://" not in trimmed:
         raise ValueError(
             f"proxy URL {trimmed!r} is missing a scheme (e.g. 'http://', 'https://', 'socks5://')"
@@ -80,9 +67,6 @@ def parse_proxy_url(url: str) -> dict[str, str]:
     netloc = parsed.hostname
     if parsed.port is not None:
         netloc = f"{parsed.hostname}:{parsed.port}"
-    # Rebuild the server URL without credentials. Playwright reattaches
-    # them via the separate username/password fields; embedding them in
-    # the URL too would double-encode the auth header in some proxies.
     server = f"{parsed.scheme}://{netloc}"
     if parsed.path and parsed.path != "/":
         server += parsed.path
@@ -98,23 +82,12 @@ def parse_proxy_url(url: str) -> dict[str, str]:
 class ProxyManager:
     """Resolve a Playwright ``proxy=`` kwarg dict for a given account.
 
-    The manager is constructed from a parsed :class:`ProxyConfig`
-    (typically obtained from :func:`src.utils.config_loader.load_config`)
-    so the validation of policy names / URL shapes already happened at
-    config-load time. The manager itself only enforces the runtime
-    invariants: the proxies list is non-empty, and lookups for a given
-    ``account_name`` are stable under ``sticky`` policy.
-
-    The class is thread-safe for the operations exposed
-    (:meth:`resolve`); a single :class:`ProxyManager` can be shared
-    across a :class:`~src.orchestrator.parallel.ParallelCoordinator`'s
-    workers.
+    Supports sticky, round-robin, and failover (skip recently failed)
+    policies. Thread-safe.
     """
 
     def __init__(self, config: ProxyConfig) -> None:
         self._config = config
-        # Pre-validate every URL so a bad config explodes at construction
-        # time, not at first ``resolve``.
         self._parsed: list[dict[str, str]] = [parse_proxy_url(u) for u in config.urls]
         if config.policy not in VALID_POLICIES:
             raise ValueError(
@@ -123,21 +96,14 @@ class ProxyManager:
         self._policy: str = config.policy
         self._lock = threading.Lock()
         self._round_robin_index: int = 0
-        # Stable account_name -> index mapping populated lazily on first
-        # ``resolve`` so the assignment order matches the order accounts
-        # first appear (predictable for users with N accounts and M
-        # proxies).
         self._sticky_assignments: dict[str, int] = {}
         self._next_sticky_index: int = 0
 
+        # Failover state: index -> (fail_count, last_fail_monotonic)
+        self._failures: dict[int, tuple[int, float]] = {}
+
     @property
     def enabled(self) -> bool:
-        """``True`` when at least one proxy is configured.
-
-        :meth:`resolve` short-circuits to ``None`` when this is
-        ``False``; callers can use ``manager.enabled`` to skip the call
-        entirely if they want to.
-        """
         return bool(self._parsed) and self._config.enabled
 
     @property
@@ -148,32 +114,95 @@ class ProxyManager:
     def proxy_count(self) -> int:
         return len(self._parsed)
 
-    def resolve(self, account_name: str | None) -> dict[str, str] | None:
-        """Return the proxy kwargs for ``account_name`` or ``None``.
+    def _is_available(self, index: int, now: float) -> bool:
+        """Return True if the proxy at ``index`` is not in cooldown."""
+        info = self._failures.get(index)
+        if info is None:
+            return True
+        count, last = info
+        if count < _FAIL_THRESHOLD:
+            return True
+        return (now - last) >= _FAIL_COOLDOWN_S
 
-        Returns ``None`` when no proxies are configured or the manager
-        is disabled, in which case callers must omit the ``proxy=``
-        kwarg from ``launch_persistent_context``.
-        """
-        if not self.enabled:
-            return None
-        if not self._parsed:
+    def resolve(self, account_name: str | None) -> dict[str, str] | None:
+        """Return the proxy kwargs for ``account_name`` or ``None``."""
+        if not self.enabled or not self._parsed:
             return None
 
         with self._lock:
-            if self._policy == "round_robin":
-                index = self._round_robin_index % len(self._parsed)
-                self._round_robin_index += 1
-            else:  # sticky
+            n = len(self._parsed)
+            now = time.monotonic()
+
+            if self._policy == "sticky":
                 key = account_name or ""
                 if key not in self._sticky_assignments:
-                    self._sticky_assignments[key] = self._next_sticky_index % len(self._parsed)
+                    # Prefer an available proxy for new sticky assignments.
+                    chosen = None
+                    for i in range(n):
+                        idx = (self._next_sticky_index + i) % n
+                        if self._is_available(idx, now):
+                            chosen = idx
+                            break
+                    if chosen is None:
+                        chosen = self._next_sticky_index % n
+                    self._sticky_assignments[key] = chosen
                     self._next_sticky_index += 1
                 index = self._sticky_assignments[key]
 
-            # Defensive copy so callers can't mutate the manager's
-            # internal state by editing the returned dict in place.
+            elif self._policy == "failover":
+                # Prefer available proxies; fall back to any if all are cooling down.
+                index = None
+                for i in range(n):
+                    idx = (self._round_robin_index + i) % n
+                    if self._is_available(idx, now):
+                        index = idx
+                        break
+                if index is None:
+                    index = self._round_robin_index % n
+                self._round_robin_index = (index + 1) % n
+
+            else:  # round_robin
+                index = self._round_robin_index % n
+                self._round_robin_index += 1
+
             return dict(self._parsed[index])
+
+    def mark_failure(self, proxy_kwargs: dict[str, str] | None) -> None:
+        """Record a failure for the proxy that produced ``proxy_kwargs``.
+
+        After ``_FAIL_THRESHOLD`` failures the proxy is avoided for
+        ``_FAIL_COOLDOWN_S`` seconds (failover / sticky new assignments).
+        """
+        if not proxy_kwargs:
+            return
+        with self._lock:
+            index = self._find_index(proxy_kwargs)
+            if index is None:
+                return
+            count, _ = self._failures.get(index, (0, 0.0))
+            self._failures[index] = (count + 1, time.monotonic())
+            log.debug("proxy[%d] failure count=%d", index, count + 1)
+
+    def mark_success(self, proxy_kwargs: dict[str, str] | None) -> None:
+        """Clear failure state for a proxy that just worked."""
+        if not proxy_kwargs:
+            return
+        with self._lock:
+            index = self._find_index(proxy_kwargs)
+            if index is None:
+                return
+            if index in self._failures:
+                del self._failures[index]
+                log.debug("proxy[%d] success — failure state cleared", index)
+
+    def _find_index(self, proxy_kwargs: dict[str, str]) -> int | None:
+        """Return the index of a proxy matching the given kwargs, or None."""
+        server = proxy_kwargs.get("server")
+        username = proxy_kwargs.get("username")
+        for i, p in enumerate(self._parsed):
+            if p.get("server") == server and p.get("username") == username:
+                return i
+        return None
 
 
 __all__ = ["VALID_POLICIES", "ProxyManager", "parse_proxy_url"]
