@@ -14,9 +14,10 @@ source .venv/bin/activate
 ```bash
 cp .env.example .env
 # Edit .env and fill:
-#   CAPSOLVER_API_KEY
-#   PROXY_URL          (residential)
-#   OPENAI_API_KEY     (optional, for yii_image)
+#   CAPSOLVER_API_KEY     (optional until you want auto-solve)
+#   PROXY_URL             (residential, optional)
+#   OPENAI_API_KEY        (optional)
+#   TELEGRAM_* / DISCORD  (optional notifications)
 ```
 
 ## 3. Config
@@ -24,23 +25,21 @@ cp .env.example .env
 Edit `config/config.yaml`:
 
 - `event.url` → real Ticketmaster event URL
-- `proxy.enabled: true` and `proxy.urls: ["${PROXY_URL}"]`
-- `captcha.auto_solve: true`
-- `timing.humanize.enabled: true` (already on by default after this update)
+- `proxy.enabled: true` and `proxy.urls: ["${PROXY_URL}"]` when you have a proxy
+- `captcha.auto_solve: true` when you have CapSolver
+- `timing.humanize.enabled: true` (already on by default)
 
 Copy and fill accounts:
 
 ```bash
 cp config/accounts.yaml.example config/accounts.yaml
-# or rely on TM_EMAIL / TM_PASSWORD in .env
 ```
 
-## 4. Real Chromium profile (recommended)
+## 4. Warm up the Chromium profile (recommended)
 
 ```bash
-mkdir -p sessions/default
-# Open Chromium once manually, log into Ticketmaster, accept cookies,
-# then point browser.user_data_dir at that folder.
+python scripts/warmup_profile.py --url https://www.ticketmaster.com.br/
+# Log in manually if needed. Session is saved in sessions/default.
 ```
 
 ## 5. Validate
@@ -56,16 +55,17 @@ python run.py --explain
 python run.py --no-headless --no-auto-purchase
 ```
 
-Watch the log for:
+## 7. Vendors
 
-- `Proxy OK — public IP: …`
-- Vendor detection (US / SG / BR)
-- Captcha solver attempts
+| Host | Adapter |
+|------|---------|
+| ticketmaster.com | ticketmaster |
+| ticketmaster.sg | ticketmaster_sg |
+| ticketmaster.com.br | ticketmaster_br |
 
-## 7. Brazil note
-
-`ticketmaster.com.br` is detected and mapped to the default US adapter.
-Expect selector and flow differences; treat the first runs as exploratory.
+The BR adapter reuses the US flow with BR-oriented selectors in
+`config/selectors/ticketmaster_br.yaml`. Expect to refine selectors after
+the first real runs.
 
 ## 8. Only after success
 
