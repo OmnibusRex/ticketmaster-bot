@@ -1,9 +1,4 @@
-"""Entry point for the Ticketmaster bot.
-
-The argparse surface lives in :mod:`src.cli`. This module is responsible
-for wiring the parsed namespace into config loading, vendor resolution,
-account selection, and the runner launch path.
-"""
+"""Entry point for the Ticketmaster bot."""
 
 from __future__ import annotations
 
@@ -16,7 +11,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Allow `python src/main.py` and `python -m src.main` both to work
 _here = Path(__file__).resolve().parent
 if str(_here.parent) not in sys.path:
     sys.path.insert(0, str(_here.parent))
@@ -26,18 +20,15 @@ from src.registry import vendors as vendor_registry  # noqa: E402
 from src.utils.config_loader import config_to_yaml, load_config  # noqa: E402
 from src.utils.logger import setup_logger  # noqa: E402
 
-#: Default vendor adapter name when no host-specific match is found.
 DEFAULT_VENDOR = "ticketmaster"
 
-#: Mapping from event-URL host suffix to vendor adapter name.
-#: ticketmaster.com.br falls through to the default US adapter (no dedicated BR adapter yet).
 _HOST_VENDOR_MAP: tuple[tuple[str, str], ...] = (
     ("ticketmaster.sg", "ticketmaster_sg"),
+    ("ticketmaster.com.br", "ticketmaster_br"),
 )
 
 
 def detect_vendor_for_url(url: str) -> str:
-    """Return the vendor adapter name implied by ``url``'s host."""
     host = (urlparse(url).hostname or "").lower()
     if not host:
         return DEFAULT_VENDOR
@@ -48,8 +39,7 @@ def detect_vendor_for_url(url: str) -> str:
 
 
 def _resolve_vendor_adapter(name: str) -> Any:
-    """Look up the vendor adapter class for ``name`` or raise ValueError."""
-    import src.vendors  # noqa: F401  (registers all VendorAdapters)
+    import src.vendors  # noqa: F401
 
     try:
         return vendor_registry.get(name)
@@ -59,42 +49,33 @@ def _resolve_vendor_adapter(name: str) -> Any:
 
 
 async def _check_proxies(config, log) -> None:
-    """If proxies are enabled, try them with automatic fallback and log the IP."""
     if not config.proxy.enabled or not config.proxy.urls:
         return
-
     from src.proxy import ProxyManager, resolve_with_fallback
 
     manager = ProxyManager(config.proxy)
     log.info("Proxy policy=%s | count=%d", manager.policy, manager.proxy_count)
-
     proxy = await resolve_with_fallback(manager, account_name=None)
     if proxy is None:
         log.warning("No working proxy found.")
         return
-
-    server = proxy.get("server", "")
-    log.info("Selected proxy: %s", server)
+    log.info("Selected proxy: %s", proxy.get("server", ""))
 
 
 def _readiness_warnings(config, log) -> None:
-    """Emit warnings for common missing pieces before launch."""
     url = config.events[0].url if config.events else ""
     if "REPLACE_WITH" in url or not url.startswith("http"):
         log.warning("Event URL looks like a placeholder: %s", url)
-
     if not config.accounts:
         log.warning("No accounts configured. Set accounts.yaml or TM_EMAIL / TM_PASSWORD.")
-
     if config.captcha.auto_solve:
         if "capsolver" in config.captcha.providers and not os.getenv("CAPSOLVER_API_KEY"):
             log.warning("captcha.auto_solve is on and capsolver is listed, but CAPSOLVER_API_KEY is unset.")
         if "openai_vlm" in config.captcha.providers and not os.getenv("OPENAI_API_KEY"):
             log.warning("captcha.auto_solve is on and openai_vlm is listed, but OPENAI_API_KEY is unset.")
-
     host = (urlparse(url).hostname or "").lower()
     if "ticketmaster.com.br" in host:
-        log.info("ticketmaster.com.br detected — using US adapter as best-effort (no dedicated BR adapter).")
+        log.info("ticketmaster.com.br detected — using ticketmaster_br adapter.")
 
 
 async def main_async(args: argparse.Namespace | None = None) -> int:
@@ -170,17 +151,14 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         config.tickets.quantity,
         config.checkout.auto_purchase,
     )
-    if args.parallel or args.max_parallel is not None or args.stagger_seconds is not None:
-        log.info(
-            "Parallel: %s | max_parallel: %s | stagger_seconds: %s",
-            args.parallel,
-            args.max_parallel,
-            args.stagger_seconds,
-        )
     log.info("=" * 60)
 
     _readiness_warnings(config, log)
     await _check_proxies(config, log)
+
+    from src.notify import notify
+
+    await notify(f"Bot starting | vendor={resolved_vendor} | event={config.events[0].url if config.events else '?'}")
 
     account = None
     if args.account_name:
@@ -202,14 +180,9 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         if not config.accounts:
             log.error("--parallel requires at least one account in accounts.yaml")
             return 2
-        if args.account_name and account is not None:
-            parallel_accounts = [account]
-        else:
-            parallel_accounts = list(config.accounts)
+        parallel_accounts = [account] if (args.account_name and account) else list(config.accounts)
         max_parallel = args.max_parallel if args.max_parallel is not None else 3
         stagger_seconds = args.stagger_seconds if args.stagger_seconds is not None else 5.0
-
-        adapter_cls()
 
         def _factory(acct, cfg, _stop):  # noqa: ANN001
             return adapter_cls().build_runner(cfg, account=acct)
@@ -225,10 +198,13 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
             success = await coordinator.run()
         except KeyboardInterrupt:
             log.warning("Interrupted by user")
+            await notify("Bot interrupted by user")
             return 130
         except Exception:
             log.exception("Parallel coordinator crashed")
+            await notify("Bot crashed (parallel)")
             return 1
+        await notify("Bot finished (parallel) success=" + str(success))
         return 0 if success else 1
 
     adapter = adapter_cls()
@@ -237,10 +213,14 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         success = await runner.run()
     except KeyboardInterrupt:
         log.warning("Interrupted by user")
+        await notify("Bot interrupted by user")
         return 130
     except Exception:
         log.exception("Bot crashed")
+        await notify("Bot crashed")
         return 1
+
+    await notify("Bot finished success=" + str(success))
     return 0 if success else 1
 
 
