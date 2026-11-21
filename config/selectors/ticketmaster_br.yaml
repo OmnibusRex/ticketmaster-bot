@@ -1,0 +1,21 @@
+# Best-effort selectors for ticketmaster.com.br
+# Many flows are similar to the US site but labels and some DOM differ.
+# Update after real recon.
+
+login:
+  email: "input[name='email'], input[type='email']"
+  password: "input[name='password'], input[type='password']"
+  submit: "button[type='submit'], button:has-text('Entrar'), button:has-text('Login')"
+
+cookie_banner:
+  accept: "button:has-text('Aceitar'), button:has-text('Accept'), #onetrust-accept-btn-handler"
+
+queue:
+  indicator: ".queue-it, #queue-it, [data-queue]"
+
+tickets:
+  quantity_select: "select[name*='qty'], select[id*='quantity']"
+  add_to_cart: "button:has-text('Adicionar'), button:has-text('Add to Cart'), button:has-text('Comprar')"
+
+checkout:
+  place_order: "button:has-text('Finalizar'), button:has-text('Place Order'), button:has-text('Confirmar')"
