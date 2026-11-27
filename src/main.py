@@ -151,14 +151,16 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         config.tickets.quantity,
         config.checkout.auto_purchase,
     )
+    if args.parallel:
+        log.info(
+            "Parallel: %s | max_parallel: %s | stagger_seconds: %s",
+            args.parallel,
+            args.max_parallel if args.max_parallel is not None else 3,
+            args.stagger_seconds if args.stagger_seconds is not None else 5.0,
+        )
     log.info("=" * 60)
 
     _readiness_warnings(config, log)
-    await _check_proxies(config, log)
-
-    from src.notify import notify
-
-    await notify(f"Bot starting | vendor={resolved_vendor} | event={config.events[0].url if config.events else '?'}")
 
     account = None
     if args.account_name:
@@ -174,53 +176,47 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
         log.info("Dry run: config validated successfully. Exiting before launch.")
         return 0
 
-    if args.parallel:
-        from src.orchestrator.parallel import ParallelCoordinator
+    if args.parallel and not config.accounts:
+        log.error("--parallel requires at least one account in accounts.yaml")
+        return 2
 
-        if not config.accounts:
-            log.error("--parallel requires at least one account in accounts.yaml")
-            return 2
-        parallel_accounts = [account] if (args.account_name and account) else list(config.accounts)
-        max_parallel = args.max_parallel if args.max_parallel is not None else 3
-        stagger_seconds = args.stagger_seconds if args.stagger_seconds is not None else 5.0
+    from src.notify import notify
 
-        def _factory(acct, cfg, _stop):  # noqa: ANN001
-            return adapter_cls().build_runner(cfg, account=acct)
-
-        coordinator = ParallelCoordinator(
-            accounts=parallel_accounts,
-            config=config,
-            max_parallel=max_parallel,
-            stagger_seconds=stagger_seconds,
-            runner_factory=_factory,
-        )
-        try:
-            success = await coordinator.run()
-        except KeyboardInterrupt:
-            log.warning("Interrupted by user")
-            await notify("Bot interrupted by user")
-            return 130
-        except Exception:
-            log.exception("Parallel coordinator crashed")
-            await notify("Bot crashed (parallel)")
-            return 1
-        await notify("Bot finished (parallel) success=" + str(success))
-        return 0 if success else 1
-
-    adapter = adapter_cls()
-    runner = adapter.build_runner(config, account=account)
+    await _check_proxies(config, log)
+    event_url = config.events[0].url if config.events else "?"
+    mode = " (parallel)" if args.parallel else ""
     try:
+        await notify(f"Bot starting{mode} | vendor={resolved_vendor} | event={event_url}")
+        if args.parallel:
+            from src.orchestrator.parallel import ParallelCoordinator
+
+            parallel_accounts = [account] if account is not None else list(config.accounts)
+            max_parallel = args.max_parallel if args.max_parallel is not None else 3
+            stagger_seconds = args.stagger_seconds if args.stagger_seconds is not None else 5.0
+
+            def _factory(acct, cfg, _stop):  # noqa: ANN001
+                return adapter_cls().build_runner(cfg, account=acct)
+
+            runner = ParallelCoordinator(
+                accounts=parallel_accounts,
+                config=config,
+                max_parallel=max_parallel,
+                stagger_seconds=stagger_seconds,
+                runner_factory=_factory,
+            )
+        else:
+            runner = adapter_cls().build_runner(config, account=account)
         success = await runner.run()
-    except KeyboardInterrupt:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         log.warning("Interrupted by user")
-        await notify("Bot interrupted by user")
+        await notify(f"Bot interrupted by user{mode}")
         return 130
     except Exception:
-        log.exception("Bot crashed")
-        await notify("Bot crashed")
+        log.exception("Bot crashed%s", mode)
+        await notify(f"Bot crashed{mode}", level="error")
         return 1
 
-    await notify("Bot finished success=" + str(success))
+    await notify(f"Bot finished{mode} success={success}")
     return 0 if success else 1
 
 

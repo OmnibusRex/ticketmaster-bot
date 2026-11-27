@@ -14,9 +14,9 @@ notifier retries only when the failure is plausibly transient:
 
 * ``httpx.TimeoutException`` (any subclass: connect/read/write/pool)
 * ``httpx.NetworkError`` (connection refused, DNS, etc.)
-* Server responses with status in ``[500, 600)``
+* Server responses with status 429 or in ``[500, 600)``
 
-Anything else (most importantly any ``4xx`` response) is surfaced as a
+Anything else (most importantly other ``4xx`` response) is surfaced as a
 :class:`~src.notifiers.base.NotifierError` immediately - we never retry on
 4xx because those indicate a malformed request and re-sending will not help.
 Between attempts the notifier sleeps ``backoff_base * 2**(attempt-1)``
@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,16 @@ import httpx
 from .base import Notifier, NotifierError, NotifyEvent
 
 log = logging.getLogger("ticketmaster-bot")
+_webhook_request = ContextVar("webhook_request", default=False)
+
+
+class _HideWebhookRequestURL(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # HTTPX includes the full request URL at INFO, including webhook tokens.
+        return not _webhook_request.get()
+
+
+logging.getLogger("httpx").addFilter(_HideWebhookRequestURL())
 
 
 class WebhookNotifier(Notifier):
@@ -115,15 +126,18 @@ class WebhookNotifier(Notifier):
         async with httpx.AsyncClient(timeout=timeout) as client:
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    response = await client.post(self.url, json=payload, headers=self.headers)
+                    request_logging = _webhook_request.set(True)
+                    try:
+                        response = await client.post(self.url, json=payload, headers=self.headers)
+                    finally:
+                        _webhook_request.reset(request_logging)
                 except (httpx.TimeoutException, httpx.NetworkError) as exc:
                     last_error = exc
                     log.warning(
-                        "[webhook] %s attempt %d/%d failed: %s",
-                        self.url,
+                        "[webhook] attempt %d/%d failed: %s",
                         attempt,
                         self.max_attempts,
-                        exc,
+                        type(exc).__name__,
                     )
                     if attempt >= self.max_attempts:
                         break
@@ -135,38 +149,20 @@ class WebhookNotifier(Notifier):
                     self.last_response = response
                     return
 
-                if 500 <= status < 600:
-                    last_error = NotifierError(f"webhook POST to {self.url} returned {status}")
-                    log.warning(
-                        "[webhook] %s attempt %d/%d got %d body=%r",
-                        self.url,
-                        attempt,
-                        self.max_attempts,
-                        status,
-                        response.text[:200],
-                    )
-                    if attempt >= self.max_attempts:
-                        break
-                    await self._sleep_for_attempt(attempt)
-                    continue
+                last_error = NotifierError(f"webhook POST failed with status {status}")
+                if status != 429 and not 500 <= status < 600:
+                    raise last_error
 
-                # 1xx/3xx/4xx - never retried.
-                raise NotifierError(
-                    f"webhook POST to {self.url} failed with status {status}: "
-                    f"{response.text[:200]!r}"
-                )
+                log.warning("[webhook] attempt %d/%d got %d", attempt, self.max_attempts, status)
+                if attempt >= self.max_attempts:
+                    break
+                await self._sleep_for_attempt(attempt)
 
         if isinstance(last_error, NotifierError):
             raise last_error
-        if last_error is not None:
-            raise NotifierError(
-                f"webhook POST to {self.url} failed after "
-                f"{self.max_attempts} attempts: {last_error}"
-            ) from last_error
-        # Defensive: loop should always either return or raise.
-        raise NotifierError(  # pragma: no cover
-            f"webhook POST to {self.url} failed without a captured error"
-        )
+        raise NotifierError(
+            f"webhook POST failed after {self.max_attempts} attempts ({type(last_error).__name__})"
+        ) from None
 
     # ------------------------------------------------------------------
     # helpers
