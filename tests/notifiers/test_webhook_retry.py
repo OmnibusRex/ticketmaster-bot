@@ -241,3 +241,90 @@ def test_webhook_notifier_registered() -> None:
 
     cls = notifier_registry.get("webhook")
     assert cls is WebhookNotifier
+
+
+@pytest.mark.asyncio
+async def test_webhook_retries_429_and_hides_endpoint_secret(caplog) -> None:
+    server = _SequenceServer([429, 200])
+    async with _serve(server) as base:
+        notifier = WebhookNotifier(f"{base}/hook?token=private-test-token", backoff_base=0)
+        with caplog.at_level("INFO"):
+            await notifier.notify(_make_event())
+
+    assert server.hits == 2
+    assert "429" in caplog.text
+    assert "private-test-token" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_401_without_retrying() -> None:
+    server = _SequenceServer([401])
+    async with _serve(server) as base:
+        notifier = WebhookNotifier(f"{base}/hook", backoff_base=0)
+        with pytest.raises(NotifierError, match="401"):
+            await notifier.notify(_make_event())
+
+    assert server.hits == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_retries_timeout() -> None:
+    server = _SequenceServer([200])
+    hits = []
+
+    @server.app.post("/slow")
+    async def slow() -> Response:
+        hits.append(True)
+        await asyncio.sleep(0.2)
+        return Response()
+
+    async with _serve(server) as base:
+        notifier = WebhookNotifier(f"{base}/slow", timeout=0.05, max_attempts=2, backoff_base=0)
+        with pytest.raises(NotifierError, match="ReadTimeout"):
+            await notifier.notify(_make_event())
+
+    assert len(hits) == 2
+
+
+@pytest.mark.asyncio
+async def test_environment_notifier_reports_rejection(monkeypatch) -> None:
+    from src.notify import notify
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    server = _SequenceServer([401])
+    async with _serve(server) as base:
+        monkeypatch.setenv("DISCORD_WEBHOOK_URL", f"{base}/hook")
+        assert await notify("Price alert") == {"discord": False}
+
+    assert server.hits == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_skips_notifications_and_build_failure_is_reported(monkeypatch) -> None:
+    from src.cli import parse_args
+    from src.main import main_async
+    from src.registry import vendors
+
+    class UnavailableAdapter:
+        def build_runner(self, config, account):
+            raise RuntimeError("Runner initialization failed")
+
+    server = _SequenceServer([204])
+    vendors.register("unavailable-test-adapter", UnavailableAdapter)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    try:
+        async with _serve(server) as base:
+            monkeypatch.setenv("DISCORD_WEBHOOK_URL", f"{base}/hook")
+            args = ["--vendor", "unavailable-test-adapter"]
+            assert await main_async(parse_args([*args, "--dry-run"])) == 0
+            assert server.hits == 0
+            assert await main_async(parse_args(args)) == 1
+    finally:
+        vendors.registry.unregister("unavailable-test-adapter")
+
+    messages = [json.loads(entry["body"])["content"] for entry in server.requests]
+    assert len(messages) == 2
+    assert "Bot starting" in messages[0]
+    assert "Bot crashed" in messages[1]

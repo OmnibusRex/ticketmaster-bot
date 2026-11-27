@@ -1,57 +1,44 @@
-"""Optional outbound notifications (Telegram / Discord webhooks).
-
-No external dependency beyond httpx (already used by the captcha stack).
-Configure via environment variables; silently no-ops when unset.
-"""
+"""Optional Telegram and Discord notifications from environment settings."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from typing import Any
+
+from src.notifiers import DiscordNotifier, Notifier, NotifyEvent, TelegramNotifier
 
 log = logging.getLogger("ticketmaster-bot")
 
 
-async def notify(message: str, *, level: str = "info") -> None:
-    """Send a message to configured webhooks. Best-effort, never raises."""
-    tasks = []
-    tg = os.getenv("TELEGRAM_BOT_TOKEN")
+async def notify(
+    message: str, *, level: str = "info", event_type: str = "bot_status"
+) -> dict[str, bool]:
+    """Return whether each configured channel accepted the notification."""
+    channels: dict[str, Notifier] = {}
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
-    if tg and chat:
-        tasks.append(_telegram(tg, chat, message))
+    if token and chat:
+        channels["telegram"] = TelegramNotifier(token, chat)
+    elif token or chat:
+        log.warning("Telegram requires both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
-    discord = os.getenv("DISCORD_WEBHOOK_URL")
-    if discord:
-        tasks.append(_discord(discord, message))
+    webhook = os.getenv("DISCORD_WEBHOOK_URL")
+    if webhook:
+        channels["discord"] = DiscordNotifier(webhook)
 
-    if not tasks:
-        return
-
-    import asyncio
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _telegram(token: str, chat_id: str, text: str) -> None:
-    try:
-        import httpx
-
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json={"chat_id": chat_id, "text": text[:4000]})
-    except Exception as exc:
-        log.debug("telegram notify failed: %s", exc)
-
-
-async def _discord(webhook: str, text: str) -> None:
-    try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(webhook, json={"content": text[:2000]})
-    except Exception as exc:
-        log.debug("discord notify failed: %s", exc)
+    event = NotifyEvent(event_type, "Ticketmaster Bot", message[:1900], severity=level)
+    results = await asyncio.gather(
+        *(channel.notify(event) for channel in channels.values()), return_exceptions=True
+    )
+    delivered = {}
+    for channel, result in zip(channels, results, strict=True):
+        delivered[channel] = result is None
+        if result is None:
+            log.info("Notification accepted by %s", channel)
+        else:
+            log.warning("Notification failed on %s (%s)", channel, type(result).__name__)
+    return delivered
 
 
 __all__ = ["notify"]

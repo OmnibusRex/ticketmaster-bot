@@ -7,8 +7,8 @@ description, severity-mapped colour, and an ISO-8601 timestamp.
 
 Retry semantics are inherited verbatim from :class:`WebhookNotifier`:
 3 attempts, exponential backoff, retry only on
-``httpx.TimeoutException``/``httpx.NetworkError`` and ``5xx`` responses, and
-never on ``4xx``. Discord's standard success status is 204 No Content; any
+``httpx.TimeoutException``/``httpx.NetworkError`` and ``429`` or ``5xx`` responses, and
+never on other ``4xx``. Discord's standard success status is 204 No Content; any
 2xx is treated as success.
 
 Colour map (24-bit RGB, encoded as int per Discord's webhook API):

@@ -35,8 +35,8 @@ as a notifier failure. Slack's documented success body is exactly
 
 Retry semantics are inherited verbatim from :class:`WebhookNotifier`:
 3 attempts by default, exponential backoff, retry only on
-``httpx.TimeoutException``/``httpx.NetworkError`` and ``5xx`` responses,
-never on ``4xx``. Slack-side body errors are **terminal**: a malformed
+``httpx.TimeoutException``/``httpx.NetworkError`` and ``429`` or ``5xx`` responses,
+never on other ``4xx``. Slack-side body errors are **terminal**: a malformed
 payload will not become well-formed on retry, so :class:`SlackNotifier`
 raises :class:`NotifierError` immediately on a non-``ok`` body without
 re-sending.

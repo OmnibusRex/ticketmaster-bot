@@ -12,8 +12,8 @@ break the surrounding bold formatting.
 
 Retry semantics are inherited verbatim from :class:`WebhookNotifier`:
 3 attempts by default, exponential backoff, retry only on
-``httpx.TimeoutException``/``httpx.NetworkError`` and ``5xx`` responses,
-and never on ``4xx`` (Telegram replies with ``400`` for malformed payloads
+``httpx.TimeoutException``/``httpx.NetworkError`` and ``429`` or ``5xx`` responses,
+and never on other ``4xx`` (Telegram replies with ``400`` for malformed payloads
 such as an unknown ``chat_id`` or invalid escape sequence - those will
 not be cured by retrying).
 
