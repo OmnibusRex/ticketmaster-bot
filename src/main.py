@@ -153,7 +153,8 @@ async def main_async(args: argparse.Namespace | None = None) -> int:
     )
     if args.parallel:
         log.info(
-            "Parallel: max_parallel=%s | stagger_seconds=%s",
+            "Parallel: %s | max_parallel: %s | stagger_seconds: %s",
+            args.parallel,
             args.max_parallel if args.max_parallel is not None else 3,
             args.stagger_seconds if args.stagger_seconds is not None else 5.0,
         )
