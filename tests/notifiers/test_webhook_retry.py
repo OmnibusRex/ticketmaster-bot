@@ -328,3 +328,19 @@ async def test_dry_run_skips_notifications_and_build_failure_is_reported(monkeyp
     assert len(messages) == 2
     assert "Bot starting" in messages[0]
     assert "Bot crashed" in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_environment_notifier_can_target_one_channel(monkeypatch) -> None:
+    from src.notify import notify
+
+    server = _SequenceServer([204])
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    async with _serve(server) as base:
+        monkeypatch.setenv("DISCORD_WEBHOOK_URL", f"{base}/hook")
+        assert await notify("Price alert", only_channels={"telegram"}) == {}
+        assert server.hits == 0
+        assert await notify("Price alert", only_channels={"discord"}) == {"discord": True}
+
+    assert server.hits == 1

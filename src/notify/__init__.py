@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Collection
 
 from src.notifiers import DiscordNotifier, Notifier, NotifyEvent, TelegramNotifier
 
@@ -12,7 +13,11 @@ log = logging.getLogger("ticketmaster-bot")
 
 
 async def notify(
-    message: str, *, level: str = "info", event_type: str = "bot_status"
+    message: str,
+    *,
+    level: str = "info",
+    event_type: str = "bot_status",
+    only_channels: Collection[str] | None = None,
 ) -> dict[str, bool]:
     """Return whether each configured channel accepted the notification."""
     channels: dict[str, Notifier] = {}
@@ -26,6 +31,9 @@ async def notify(
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if webhook:
         channels["discord"] = DiscordNotifier(webhook)
+
+    if only_channels is not None:
+        channels = {name: notifier for name, notifier in channels.items() if name in only_channels}
 
     event = NotifyEvent(event_type, "Ticketmaster Bot", message[:1900], severity=level)
     results = await asyncio.gather(

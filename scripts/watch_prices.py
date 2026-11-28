@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import re
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,6 +27,40 @@ ROW = "[data-bdd='quick-pick-row']"
 PRICE = "[data-bdd='ticket-price'], [data-bdd='offer-price']"
 EMPTY = "[data-bdd='sold-out']"
 UNAVAILABLE = '[aria-disabled="true"], [disabled], [data-available="false"]'
+
+FAILURE_LIMIT = 3
+DELIVERY_RETRIES = 2
+CONTEXT_FIELDS = {
+    "section": "[data-bdd='section'], [data-bdd='offer-section']",
+    "ticket_type": "[data-bdd='ticket-type'], [data-bdd='offer-type']",
+    "fees": "[data-bdd='fee-status'], [data-bdd='offer-fees']",
+}
+
+
+@dataclass(frozen=True)
+class Offer:
+    cents: int
+    section: str = ""
+    ticket_type: str = ""
+    fees: str = ""
+
+    def describe(self, currency: str) -> str:
+        details = [f"{currency} {self.cents // 100}.{self.cents % 100:02d}"]
+        for label, value in (
+            ("Section", self.section),
+            ("Ticket type", self.ticket_type),
+            ("Fee information", self.fees),
+        ):
+            if value:
+                details.append(f"{label}: {value}")
+        return " | ".join(details)
+
+
+@dataclass
+class PendingAlert:
+    message: str
+    channels: set[str]
+    retries_left: int = DELIVERY_RETRIES
 
 
 class UnreadableOffers(Exception):
@@ -72,7 +108,7 @@ def configured_url(path: Path) -> str:
     return event["url"]
 
 
-async def read_offers(page, args) -> list[str]:
+async def read_offers(page, args) -> list[Offer]:
     from playwright.async_api import TimeoutError as PlaywrightTimeout
 
     response = await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
@@ -99,56 +135,120 @@ async def read_offers(page, args) -> list[str]:
     if await empty.count() and not await rows.count():
         return []
 
-    prices = []
+    offers = []
     for row in await available.all():
         price = row.locator(args.price_selector).and_(page.locator("css=:visible"))
         try:
-            prices.append(await price.inner_text(timeout=3000))
+            text = await price.inner_text(timeout=3000)
         except PlaywrightTimeout:
             raise UnreadableOffers("an available row has no readable price") from None
-    return prices
+        cents = parse_price(text, args.currency)
+        if cents is None:
+            raise UnreadableOffers(f"an offer has an ambiguous {args.currency} price")
+        details = {}
+        for name, default_selector in CONTEXT_FIELDS.items():
+            selector = getattr(args, f"{name}_selector", default_selector)
+            fields = row.locator(selector).and_(page.locator("css=:visible"))
+            values = dict.fromkeys(
+                " ".join(value.split()) for value in await fields.all_inner_texts()
+            )
+            details[name] = " / ".join(value for value in values if value)[:200]
+        offers.append(Offer(cents, **details))
+    return offers
 
 
-async def monitor(page, args, notify) -> None:
+async def check(page, args) -> tuple[datetime, Offer | None] | None:
     from playwright.async_api import Error as PlaywrightError
 
+    try:
+        offers = await read_offers(page, args)
+    except (PlaywrightError, UnreadableOffers) as exc:
+        print(f"Offer check failed: {exc}", file=sys.stderr, flush=True)
+        return None
+
+    observed_at = datetime.now(timezone.utc)
+    cheapest = min(offers, key=lambda offer: offer.cents, default=None)
+    if cheapest is None:
+        print(f"{observed_at.isoformat()} | No available offers.", flush=True)
+    else:
+        print(
+            f"{observed_at.isoformat()} | Lowest displayed offer: {cheapest.describe(args.currency)}",
+            flush=True,
+        )
+    return observed_at, cheapest
+
+
+def failed_channels(results: dict[str, bool]) -> set[str]:
+    if not results:
+        print("No notification channels configured.", flush=True)
+    for channel, delivered in results.items():
+        print(f"{channel}: {'accepted' if delivered else 'failed'}", flush=True)
+    return {channel for channel, delivered in results.items() if not delivered}
+
+
+async def monitor(page, args, notify) -> int:
     below_threshold = False
+    pending = None
+    last_valid = None
+    failures = 0
     while True:
-        try:
-            texts = await read_offers(page, args)
-            prices = []
-            for value in texts:
-                cents = parse_price(value, args.currency)
-                if cents is None:
-                    raise UnreadableOffers(f"an offer has an ambiguous {args.currency} price")
-                prices.append(cents)
-        except (PlaywrightError, UnreadableOffers) as exc:
-            print(f"Offer check failed: {exc}", file=sys.stderr, flush=True)
+        reading = await check(page, args)
+        if args.once:
+            return 0 if reading is not None else 1
+
+        if reading is None:
+            failures += 1
+            if failures == FAILURE_LIMIT:
+                last = last_valid.isoformat() if last_valid else "none since startup"
+                message = f"Price watcher has {failures} consecutive failed checks. Last valid check: {last}."
+                print(message, file=sys.stderr, flush=True)
+                await notify(message, event_type="watcher_degraded", level="warning")
         else:
-            if not prices:
-                print("No available offers.", flush=True)
-            else:
-                cheapest = min(prices)
-                display = f"{args.currency} {cheapest // 100}.{cheapest % 100:02d}"
-                print(f"Lowest displayed offer: {display}", flush=True)
-                if cheapest <= args.max and not below_threshold:
-                    message = f"Price alert: {display} on {args.url}"
-                    print(message, flush=True)
-                    results = await notify(message, event_type="price_alert")
-                    if results:
-                        for channel, delivered in results.items():
-                            status = "accepted" if delivered else "failed"
-                            print(f"{channel}: {status}", flush=True)
-                    else:
-                        print("No notification channels configured.", flush=True)
-                below_threshold = cheapest <= args.max
+            last_valid, cheapest = reading
+            if failures >= FAILURE_LIMIT:
+                message = f"Price watcher recovered at {last_valid.isoformat()}."
+                print(message, flush=True)
+                await notify(message, event_type="watcher_recovered")
+            failures = 0
+
+            if cheapest is None:
+                pending = None
+            elif cheapest.cents > args.max:
+                below_threshold = False
+                pending = None
+            elif not below_threshold:
+                below_threshold = True
+                message = (
+                    f"Price alert: {cheapest.describe(args.currency)} | "
+                    f"Observed at {last_valid.isoformat()} | {args.url}"
+                )
+                print(message, flush=True)
+                failed = failed_channels(await notify(message, event_type="price_alert"))
+                if failed:
+                    pending = PendingAlert(message, failed)
+            elif pending is not None:
+                results = await notify(
+                    pending.message, event_type="price_alert", only_channels=pending.channels
+                )
+                pending.channels = failed_channels(results)
+                pending.retries_left -= 1
+                if not pending.channels or pending.retries_left == 0:
+                    if pending.channels:
+                        print(
+                            "Price alert delivery retries exhausted.", file=sys.stderr, flush=True
+                        )
+                    pending = None
+
         await asyncio.sleep(args.interval)
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Watch displayed ticket prices")
     parser.add_argument("--url")
-    parser.add_argument("--max", type=positive_cents, required=True)
+    parser.add_argument("--max", type=positive_cents)
+    parser.add_argument(
+        "--once", action="store_true", help="read once without sending notifications"
+    )
     parser.add_argument("--interval", type=positive_seconds, default=120)
     parser.add_argument("--config", type=Path, default=Path("config/config.yaml"))
     parser.add_argument("--accounts", help=argparse.SUPPRESS)
@@ -158,7 +258,11 @@ async def main() -> int:
     parser.add_argument("--offer-selector", default=ROW)
     parser.add_argument("--price-selector", default=PRICE)
     parser.add_argument("--empty-selector", default=EMPTY)
+    for name, selector in CONTEXT_FIELDS.items():
+        parser.add_argument(f"--{name.replace('_', '-')}-selector", default=selector)
     args = parser.parse_args()
+    if args.max is None and not args.once:
+        parser.error("--max is required unless --once is set")
     try:
         args.url = args.url or configured_url(args.config)
         url = urlsplit(args.url)
@@ -186,10 +290,9 @@ async def main() -> int:
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-            await monitor(page, args, notify)
+            return await monitor(page, args, notify)
         finally:
             await context.close()
-    return 0
 
 
 if __name__ == "__main__":

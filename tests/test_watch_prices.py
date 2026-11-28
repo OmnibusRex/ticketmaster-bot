@@ -31,6 +31,7 @@ def arguments(currency):
         empty_selector=EMPTY,
         currency=currency,
         interval=0,
+        once=False,
         max=30000,
     )
 
@@ -79,7 +80,7 @@ async def test_reads_only_visible_available_offer_prices(
         await route.fulfill(content_type="text/html", body=html)
 
     await page.route(args.url, serve)
-    assert [parse_price(value, currency) for value in await read_offers(page, args)] == expected
+    assert [offer.cents for offer in await read_offers(page, args)] == expected
 
 
 async def test_alert_rearms_only_after_valid_price_above_threshold(chromium_context):
@@ -138,4 +139,82 @@ async def test_waits_for_offers_rendered_after_navigation(chromium_context):
         await route.fulfill(content_type="text/html", body=html)
 
     await page.route(args.url, serve)
-    assert await read_offers(page, args) == ["R$ 350,00"]
+    assert [offer.cents for offer in await read_offers(page, args)] == [35000]
+
+
+@pytest.mark.parametrize("status", [200, 503])
+async def test_once_reads_one_page_and_sends_nothing(chromium_context, capsys, status):
+    page = await chromium_context.new_page()
+    args = arguments("USD")
+    args.once = True
+    args.max = None
+    visits = []
+    notifications = []
+    html = (FIXTURES / "us.html").read_text()
+
+    async def serve(route):
+        visits.append(route.request.url)
+        await route.fulfill(status=status, content_type="text/html", body=html)
+
+    async def record(*args, **kwargs):
+        notifications.append(args)
+
+    await page.route(args.url, serve)
+    assert await monitor(page, args, record) == (0 if status == 200 else 1)
+    assert visits == [args.url]
+    assert notifications == []
+    captured = capsys.readouterr()
+    if status == 200:
+        assert "USD 300.00" in captured.out
+    else:
+        assert "navigation failed (503)" in captured.err
+
+
+async def test_retries_only_failed_channel_and_reports_outage(chromium_context, capsys):
+    page = await chromium_context.new_page()
+    args = arguments("USD")
+    html = (
+        (FIXTURES / "us.html")
+        .read_text()
+        .replace(
+            '<span data-bdd="ticket-price">$300.00</span>',
+            """
+        <span data-bdd="ticket-price">$300.00</span>
+        <span data-bdd="offer-section">Lower Bowl</span>
+        <span data-bdd="offer-type">Adult</span>
+        <span data-bdd="offer-fees">Fees included</span>
+        """,
+        )
+    )
+    sold_out = '<p data-bdd="sold-out">Sold out</p>'
+    checks = iter([html, html, html, html, None, None, None, None, sold_out])
+    calls = []
+
+    async def serve(route):
+        body = next(checks)
+        await route.fulfill(status=200 if body else 503, content_type="text/html", body=body or "")
+
+    async def record(message, *, event_type, only_channels=None, level="info"):
+        calls.append((event_type, only_channels, message, level))
+        if event_type == "watcher_recovered":
+            raise asyncio.CancelledError
+        if only_channels:
+            return {"telegram": False}
+        return {"discord": True, "telegram": False}
+
+    await page.route(args.url, serve)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(monitor(page, args, record), timeout=15)
+    assert [(kind, channels) for kind, channels, _, _ in calls] == [
+        ("price_alert", None),
+        ("price_alert", {"telegram"}),
+        ("price_alert", {"telegram"}),
+        ("watcher_degraded", None),
+        ("watcher_recovered", None),
+    ]
+    assert (
+        "Section: Lower Bowl | Ticket type: Adult | Fee information: Fees included" in calls[0][2]
+    )
+    assert "Last valid check: " in calls[3][2]
+    assert calls[3][3] == "warning"
+    assert "delivery retries exhausted" in capsys.readouterr().err

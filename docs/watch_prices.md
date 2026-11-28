@@ -37,3 +37,31 @@ Alerts appear in the terminal. To also send them through Telegram, set
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment or in the
 repository's `.env`. For Discord, set `DISCORD_WEBHOOK_URL`. The watcher
 reports acceptance or failure for each configured channel.
+
+## One-time check
+
+```bash
+python scripts/watch_prices.py --url 'https://www.ticketmaster.com.br/event/EXAMPLE' --once
+```
+
+Replace the example URL with the event to check. This mode makes one
+check and prints the result without sending notifications or requiring
+`--max`. It exits with status 0 after a valid check, including a recognized
+sold-out page, or 1 if the watcher cannot read the page.
+
+## Offer details and notification recovery
+
+When present on the same offer row, the alert includes the section, ticket
+type and explicitly displayed fee information. Set
+`--section-selector`, `--ticket-type-selector` or `--fees-selector` to match
+the page layout. Missing fee information stays unspecified.
+
+When a price alert fails on a channel, the watcher retries that channel
+on up to two subsequent valid checks while an offer remains within the
+threshold. The message retains its original observation timestamp. A valid
+check with no offers or a price above the threshold clears pending
+deliveries. The retry state lives in memory and resets on restart.
+
+After three consecutive failed checks the watcher issues a warning with
+the UTC time of the last valid check. It sends one recovery notice when
+the next valid reading arrives, including a recognized sold-out page.
